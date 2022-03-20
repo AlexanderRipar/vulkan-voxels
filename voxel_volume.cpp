@@ -1,7 +1,6 @@
 #include "voxel_volume.hpp"
 
 #include "vulkan_base.hpp"
-#include "bitmap.h"
 
 #include <och_matmath.h>
 #include <och_fmt.h>

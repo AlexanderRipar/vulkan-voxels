@@ -7,10 +7,8 @@
 #include <och_err.h>
 #include <och_fio.h>
 #include <och_virtual_keys.h>
-#include <och_utf8.h>
 
 #include "heap_buffer.h"
-#include "simple_vec.h"
 
 struct required_extension_layer_list
 {
