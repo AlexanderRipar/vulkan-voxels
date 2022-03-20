@@ -7,10 +7,6 @@ find_package(Vulkan REQUIRED COMPONENTS glslc)
 
 function(compile_shaders_to_spirv GLSL_DIRECTORY SPIRV_DIRECTORY GLSLC_OPTIONS GLSL_FILES)
 
-    message("Glsl Files: " ${GLSL_FILES})
-
-    message("SPIRV Dir: " ${SPIRV_DIRECTORY})
-
     # Make sure the output directory actually exists
     file(MAKE_DIRECTORY ${SPIRV_DIRECTORY})
 
