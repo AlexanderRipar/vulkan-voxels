@@ -1,0 +1,263 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+
+
+
+
+layout (local_size_x_id = 1) in;
+layout (local_size_y_id = 2) in;
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (constant_id = 3) const uint BASE_DIM_LOG2 = 6;
+layout (constant_id = 4) const uint BRICK_DIM_LOG2 = 3;
+layout (constant_id = 5) const uint LEVEL_CNT = 1;
+
+layout (set = 0, binding = 0, rgba8) uniform writeonly image2D hit_ids;
+
+layout (set = 0, binding = 1, r32f) uniform writeonly image2D hit_times;
+
+layout (set = 0, binding = 2, r32ui) uniform readonly uimage3D base_data;
+
+layout (set = 0, binding = 3) readonly buffer Bricks {
+	uint16_t elems[];
+} bricks;
+
+layout (set = 0, binding = 4) readonly buffer Leaves {
+	uint elems[];
+} leaves;
+
+layout(push_constant) uniform Push_data {
+	vec3 origin;
+	vec2 direction_delta;
+	mat3 direction_rotation;
+} push_data;
+
+
+
+vec3 calculate_direction(in vec2 invocation, in vec2 render_extent)
+{
+	vec2 invocation_centered = vec2(invocation) - render_extent * 0.5 + 0.5;
+
+	vec3 base_direction = vec3(push_data.direction_delta * invocation_centered, -1.0);
+
+	vec3 normalized_direction = normalize(base_direction);
+
+	return normalized_direction * push_data.direction_rotation;
+}
+
+
+
+void store_result(ivec2 invocation, vec3 ray_time, float min_time, int level)
+{
+	vec3 last_step;
+
+	if(ray_time.x == -1.0)
+		last_step = vec3(0.6, 0.25, 0.1);
+	else if(min_time == ray_time.x)
+		last_step = vec3(0.75, 0.0, 0.0);
+	else if(min_time == ray_time.y)
+		last_step = vec3(0.0, 0.75, 0.0);
+	else
+		last_step = vec3(0.0, 0.0, 0.75);
+		
+	float real_min_time = min_time * float(1 << (level >> BASE_DIM_LOG2));
+
+	imageStore(hit_ids, invocation, vec4(last_step * (1.0 - real_min_time / (1.732 * float(LEVEL_CNT << (BASE_DIM_LOG2 - 1)))), 1.0));
+
+	imageStore(hit_times, invocation, vec4(real_min_time));
+}
+
+
+
+void main()
+{
+	const float BASE_DIM_HALF = float(1 << (BASE_DIM_LOG2 - 1));
+
+	const float BASE_DIM = float(1 << BASE_DIM_LOG2);
+
+	// Check if we are inside the image
+
+	ivec2 invocation = ivec2(gl_GlobalInvocationID.xy);
+
+	ivec2 render_extent = imageSize(hit_ids);
+
+	if (invocation.x > render_extent.x || invocation.y > render_extent.y)
+		return;
+
+
+
+	// Get ray parameters
+	
+	const vec3 ray_direction = calculate_direction(invocation, render_extent);
+
+	vec3 ray_index = floor(push_data.origin);
+	
+	const vec3 ray_coefficient = 1.0 / ray_direction;
+	
+	vec3 ray_offset = (vec3(greaterThanEqual(ray_coefficient, vec3(0.0))) - push_data.origin) * ray_coefficient;
+	
+
+
+	ivec3 base_index = ivec3(floor(push_data.origin)) + ivec3(1 << (BASE_DIM_LOG2 - 1));
+
+
+	
+	vec3 ray_time = vec3(-1.0);
+
+	float min_time = 0.0;
+
+	int loopcnt = 0;
+
+	int level = 0;
+
+	float level_scale = 1.0;
+
+
+
+	// Start a-looping
+
+	while (level < BASE_DIM * float(LEVEL_CNT))
+	{
+		while (max(max(ray_index.x, ray_index.y), ray_index.z) < float(1 << (BASE_DIM_LOG2 - 1)) && min(min(ray_index.x, ray_index.y), ray_index.z) >= -BASE_DIM_HALF)
+		{
+			uint base_value = imageLoad(base_data, base_index).x;
+
+			if (loopcnt++ == 1024)
+			{
+				imageStore(hit_ids, invocation, vec4(1.0));
+
+				return;
+			}
+
+			if (base_value != 0xFFFF)
+			{
+				if(base_value == 0xFFFE)
+				{
+					store_result(invocation, ray_time, min_time, level);
+
+					return;
+				}
+
+				vec3 lower_corner = ray_index;
+
+				vec3 upper_corner = lower_corner + 0.999999;
+
+				vec3 entry_position = clamp(ray_direction * min_time + push_data.origin * level_scale, lower_corner, upper_corner);
+
+				ivec3 brick_index = ivec3(floor(entry_position * float(1 << BRICK_DIM_LOG2))) & ((1 << BRICK_DIM_LOG2) - 1);
+
+				vec3 ray_index_adjustment = vec3(brick_index) * (1.0 / float(1 << BRICK_DIM_LOG2)) - vec3(greaterThanEqual(ray_coefficient, vec3(0.0))) * (float((1 << BRICK_DIM_LOG2) - 1) / float(1 << BRICK_DIM_LOG2));
+
+				vec3 ray_subindex = ray_index + ray_index_adjustment;
+
+				int brick_buffer_begin = int(base_value) * (1 << (BRICK_DIM_LOG2 * 3));
+
+				int brick_buffer_offset = brick_index.x + brick_index.y * (1 << BRICK_DIM_LOG2) + brick_index.z * (1 << (BRICK_DIM_LOG2 * 2));
+
+				int steps = 0;
+
+				while(max(max(uint(brick_index.x), uint(brick_index.y)), uint(brick_index.z)) < (1 << BRICK_DIM_LOG2))
+				{
+					++steps;
+
+					uint brick_value = uint(bricks.elems[brick_buffer_begin + brick_buffer_offset]);
+
+					if (loopcnt++ == 1024)
+					{
+						imageStore(hit_ids, invocation, vec4(1.0));
+
+						return;
+					}
+
+					if (brick_value != 0u)
+					{
+						store_result(invocation, ray_time, min_time, level);
+
+						return;
+					}
+
+					ray_time = ray_coefficient * ray_subindex + ray_offset;
+					
+					min_time = min(min(ray_time.x, ray_time.y), ray_time.z);
+
+					const float subindex_step = 1.0 / float(1 << BRICK_DIM_LOG2);
+
+					if (min_time == ray_time.x)
+					{
+						ray_subindex.x += ray_coefficient.x < 0.0 ? -subindex_step : subindex_step;
+
+						brick_buffer_offset += ray_coefficient.x < 0.0 ? -1 : 1;
+
+						brick_index.x += ray_coefficient.x < 0.0 ? -1 : 1;
+					}
+					else if (min_time == ray_time.y)
+					{
+						ray_subindex.y += ray_coefficient.y < 0.0 ? -subindex_step : subindex_step;
+
+						brick_buffer_offset += ray_coefficient.y < 0.0 ? -1 << BRICK_DIM_LOG2 : 1 << BRICK_DIM_LOG2;
+
+						brick_index.y += ray_coefficient.y < 0.0 ? -1 : 1;
+					}
+					else
+					{
+						ray_subindex.z += ray_coefficient.z < 0.0 ? -subindex_step : subindex_step;
+						
+						brick_buffer_offset += ray_coefficient.z < 0.0 ? -1 << (BRICK_DIM_LOG2 * 2) : 1 << (BRICK_DIM_LOG2 * 2);
+
+						brick_index.z += ray_coefficient.z < 0.0 ? -1 : 1;
+					}
+				}
+			}
+			
+			ray_time = ray_coefficient * ray_index + ray_offset;
+
+			min_time = min(min(ray_time.x, ray_time.y), ray_time.z);
+
+			if (min_time == ray_time.x)
+			{
+				base_index.x += ray_coefficient.x < 0.0 ? -1 : 1;
+			
+				ray_index.x += ray_coefficient.x < 0.0 ? -1.0 : 1.0;
+			}
+			else if (min_time == ray_time.y)
+			{
+				base_index.y += ray_coefficient.y < 0.0 ? -1 : 1;
+			
+				ray_index.y += ray_coefficient.y < 0.0 ? -1.0 : 1.0;
+			}
+			else
+			{
+				base_index.z += ray_coefficient.z < 0.0 ? -1 : 1;
+			
+				ray_index.z += ray_coefficient.z < 0.0 ? -1.0 : 1.0;
+			}
+		}
+
+		base_index.x -= level;
+
+		base_index = (base_index >> 1) + ivec3(1 << (BASE_DIM_LOG2 - 2));
+
+		level += (1 << BASE_DIM_LOG2);
+
+		base_index.x += level;
+		
+		
+		
+		ray_index = floor(ray_index * 0.5);
+
+		ray_offset = (ray_offset + vec3(greaterThanEqual(ray_coefficient, vec3(0.0))) * ray_coefficient) * 0.5;
+
+
+
+		min_time *= 0.5;
+
+		ray_time *= 0.5;
+
+		level_scale *= 0.5;
+	}
+
+	imageStore(hit_ids, invocation, vec4(0.0, 0.1, 0.2, 1.0));
+
+	imageStore(hit_times, invocation, vec4(intBitsToFloat(0x7F800000)));
+}

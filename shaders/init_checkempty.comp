@@ -1,0 +1,135 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_ballot: enable
+
+layout (local_size_x_id = 1) in;
+layout (local_size_y_id = 2) in;
+layout (local_size_z_id = 3) in;
+layout (local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout (constant_id = 4) const uint BASE_DIM_LOG2 = 6;
+layout (constant_id = 5) const uint BRICK_DIM_LOG2 = 4;
+
+layout (set = 0, binding = 0) buffer Base_buffer {
+	uint elems[];
+} base_buffer;
+
+layout (push_constant) uniform Push_data
+{
+	vec3 offset;
+	float scale;
+	float cutoff;
+} push_data;
+
+
+
+float d_dot_with_hashed_vec(float i, float j, float k, float x, float y, float z)
+{
+	uint h = (floatBitsToUint(i) * 73856093u) ^ (floatBitsToUint(j) * 19349663u) ^ (floatBitsToUint(k) * 83492791u);
+
+	//Two masks, which are either 0.0F or -0.0F, depending on positional hash
+	uint neg1 = h & 0x80000000u;
+	uint neg2 = (h & 0x10000000u) << 3;
+
+	//Get hash in [0, 2]
+	uint h_3 = ((h >> 4) * 3u) >> 28;
+
+	//Decide which inputs to pick depending on h_3
+	uint a, b;
+
+	if (h_3 == 0u)
+	{
+		a = floatBitsToUint(y);
+		b = floatBitsToUint(z);
+	}
+	else if (h_3 == 1u)
+	{
+		a = floatBitsToUint(x);
+		b = floatBitsToUint(z);
+	}
+	else
+	{
+		a = floatBitsToUint(x);
+		b = floatBitsToUint(y);
+	}
+
+	//Return picked inputs, either negated or not, depending on masks
+	return uintBitsToFloat(a ^ neg1) + uintBitsToFloat(b ^ neg2);
+}
+
+float simplex3d(vec3 pos)
+{
+	const float skew_factor = 1.0 / 3.0;
+	const float unskew_factor = 1.0 / 6.0;
+
+	float skew = (pos.x + pos.y + pos.z) * skew_factor;
+
+	float i0 = floor(pos.x + skew);
+	float j0 = floor(pos.y + skew);
+	float k0 = floor(pos.z + skew);
+
+	float unskew = (i0 + j0 + k0) * unskew_factor;
+
+	float x0 = pos.x - i0 + unskew;
+	float y0 = pos.y - j0 + unskew;
+	float z0 = pos.z - k0 + unskew;
+
+	float i1 = ((x0 >= y0) && (x0 >= z0)) ? 1.0 : 0.0;    //max == x
+	float j1 = ((y0 >  x0) && (y0 >= z0)) ? 1.0 : 0.0;    //max == y
+	float k1 = ((z0 >  x0) && (z0 >  y0)) ? 1.0 : 0.0;    //max == z
+	float i2 = ((x0 >= y0) || (x0 >= z0)) ? 1.0 : 0.0;    //min != x
+	float j2 = ((y0 >  x0) || (y0 >= z0)) ? 1.0 : 0.0;    //min != y
+	float k2 = ((z0 >  x0) || (z0 >  y0)) ? 1.0 : 0.0;    //min != z
+
+	float x1 = x0 - i1 + unskew_factor;
+	float y1 = y0 - j1 + unskew_factor;
+	float z1 = z0 - k1 + unskew_factor;
+
+	float x2 = x0 - i2 + unskew_factor * 2.0;
+	float y2 = y0 - j2 + unskew_factor * 2.0;
+	float z2 = z0 - k2 + unskew_factor * 2.0;
+
+	float x3 = x0 - 1.0 + unskew_factor * 3.0;
+	float y3 = y0 - 1.0 + unskew_factor * 3.0;
+	float z3 = z0 - 1.0 + unskew_factor * 3.0;
+
+	float t0 = 0.5 - x0 * x0 - y0 * y0 - z0 * z0;
+	if (t0 < 0.0F) t0 = 0.0F;
+	t0 = t0 * t0 * t0 * t0 * d_dot_with_hashed_vec(i0, j0, k0, x0, y0, z0);
+
+	float t1 = 0.5 - x1 * x1 - y1 * y1 - z1 * z1;
+	if (t1 < 0.0) t1 = 0.0;
+	t1 = t1 * t1 * t1 * t1 * d_dot_with_hashed_vec(i1 + i0, j1 + j0, k1 + k0, x1, y1, z1);
+
+	float t2 = 0.5 - x2 * x2 - y2 * y2 - z2 * z2;
+	if (t2 < 0.0) t2 = 0.0;
+	t2 = t2 * t2 * t2 * t2 * d_dot_with_hashed_vec(i2 + i0, j2 + j0, k2 + k0, x2, y2, z2);
+
+	float t3 = 0.5 - x3 * x3 - y3 * y3 - z3 * z3;
+	if (t3 < 0.0) t3 = 0.0;
+	t3 = t3 * t3 * t3 * t3 * d_dot_with_hashed_vec(1.0F + i0, 1.0F + j0, 1.0F + k0, x3, y3, z3);
+
+	return 38.0 * (t0 + t1 + t2 + t3) + 0.5;
+}
+
+void main()
+{
+	const uint BASE_DIM = 1u << BASE_DIM_LOG2;
+
+	float level_scale = float(1 << (gl_GlobalInvocationID.x >> (BASE_DIM_LOG2 + BRICK_DIM_LOG2)));
+	
+	vec3 invocation_pos = vec3((gl_GlobalInvocationID.x & ((1 << (BASE_DIM_LOG2 + BRICK_DIM_LOG2)) - 1)), gl_GlobalInvocationID.yz) - float(1 << (BASE_DIM_LOG2 + BRICK_DIM_LOG2 - 1));
+
+	vec3 pos = invocation_pos * push_data.scale * level_scale + push_data.offset;
+	
+	float simplex_val = simplex3d(pos);
+
+	uvec4 filled_bits = subgroupBallot(simplex_val > push_data.cutoff);
+
+	uint filled_cnt = subgroupBallotBitCount(filled_bits);
+
+	uvec3 invocation_brick = uvec3(gl_GlobalInvocationID) >> BRICK_DIM_LOG2;
+
+	if (filled_cnt != 0 && subgroupElect())
+		atomicAdd(base_buffer.elems[invocation_brick.x * BASE_DIM * BASE_DIM + invocation_brick.y * BASE_DIM + invocation_brick.z], filled_cnt);
+}

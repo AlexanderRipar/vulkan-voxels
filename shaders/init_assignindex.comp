@@ -1,0 +1,52 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_ballot: enable
+
+layout (local_size_x_id = 1) in;
+layout (local_size_y_id = 2) in;
+layout (local_size_z_id = 3) in;
+layout (local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout (constant_id = 4) const uint BASE_DIM_LOG2 = 6;
+layout (constant_id = 5) const uint BRICK_DIM_LOG2 = 4;
+
+layout (set = 0, binding = 0) buffer Base_buffer {
+	uint elems[];
+} base_buffer;
+
+layout (set = 0, binding = 1) buffer Atomic_index_buffer {
+	uint atomic_index;
+};
+
+layout (set = 0, binding = 2, r32ui) uniform uimage3D base_image;
+
+void main()
+{
+	const uint BASE_DIM = 1u << BASE_DIM_LOG2;
+
+	uint filled_cnt = base_buffer.elems[gl_GlobalInvocationID.x * BASE_DIM * BASE_DIM + gl_GlobalInvocationID.y * BASE_DIM + gl_GlobalInvocationID.z];
+
+	uint index;
+
+	bool needs_index = filled_cnt != 0 && filled_cnt != (1 << (BRICK_DIM_LOG2 * 3));
+
+	uvec4 needed_indices_vec = subgroupBallot(needs_index);
+
+	uint needed_indices = subgroupBallotBitCount(needed_indices_vec);
+
+	uint first_index;
+
+	if (subgroupElect() && needed_indices != 0)
+		first_index = atomicAdd(atomic_index, needed_indices);
+
+	first_index = subgroupBroadcastFirst(first_index);
+
+	if (filled_cnt == 0)
+		index = 0xFFFF;
+	else if (filled_cnt == (1 << (BRICK_DIM_LOG2 * 3)))
+		index = 0xFFFE;
+	else
+		index = first_index + subgroupBallotExclusiveBitCount(needed_indices_vec);
+	
+	imageStore(base_image, ivec3(gl_GlobalInvocationID), uvec4(index));
+}
